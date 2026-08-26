@@ -876,6 +876,7 @@ type FleetConfig struct {
 	Partnerships               PartnershipsConfig
 	MicrosoftCompliancePartner MicrosoftCompliancePartnerConfig `yaml:"microsoft_compliance_partner"`
 	ConditionalAccess          ConditionalAccessConfig          `yaml:"conditional_access"`
+	WebSocket                  WebSocketConfig                  `yaml:"websocket"`
 
 	// Deprecated: "packaging" fields were used for "Fleet Sandbox" which doesn't exist anymore.
 	Packaging PackagingConfig
@@ -914,6 +915,35 @@ func (c ConditionalAccessConfig) Validate(initFatal func(err error, msg string))
 			fmt.Errorf("%q is not a valid value (must be %q or %q)", c.CertSerialFormat, CertSerialFormatHex, CertSerialFormatDecimal),
 			"conditional_access.cert_serial_format",
 		)
+	}
+}
+
+// WebSocketConfig holds the server configuration for the agent WebSocket
+// notification transport (ADR-0011). When TransportEnabled is false (the
+// default), the WebSocket endpoint is not registered and agents poll as usual.
+type WebSocketConfig struct {
+	TransportEnabled bool          `yaml:"transport_enabled"`
+	PingInterval     time.Duration `yaml:"ping_interval"`
+	PongTimeout      time.Duration `yaml:"pong_timeout"`
+	CheckInterval    time.Duration `yaml:"check_interval"`
+	CheckBatchSize   int           `yaml:"check_batch_size"`
+}
+
+// Validate checks that the WebSocketConfig has valid values. The values feed
+// tickers and batch loops, so zero or negative values would panic or spin.
+func (w WebSocketConfig) Validate(initFatal func(err error, msg string)) {
+	if !w.TransportEnabled {
+		return
+	}
+	for name, ok := range map[string]bool{
+		"websocket.ping_interval":    w.PingInterval > 0,
+		"websocket.pong_timeout":     w.PongTimeout > 0,
+		"websocket.check_interval":   w.CheckInterval > 0,
+		"websocket.check_batch_size": w.CheckBatchSize > 0,
+	} {
+		if !ok {
+			initFatal(errors.New("must be greater than 0"), name)
+		}
 	}
 }
 
@@ -962,6 +992,11 @@ type MDMConfig struct {
 
 	// AppleEnable enables Apple MDM functionality on Fleet.
 	AppleEnable bool `yaml:"apple_enable"`
+	// AppleMachineInfoVerify controls whether the CMS/PKCS7 signature on Apple's
+	// x-apple-aspen-deviceinfo (MachineInfo) blob is verified during enrollment.
+	// Enabled by default; set to false to run verification in audit mode (log
+	// failures without blocking enrollment).
+	AppleMachineInfoVerify bool `yaml:"apple_machineinfo_verify"`
 	// AppleDEPSyncPeriodicity is the duration between DEP device syncing
 	// (fetching and setting of DEP profiles).
 	AppleDEPSyncPeriodicity time.Duration `yaml:"apple_dep_sync_periodicity"`
@@ -1544,7 +1579,7 @@ func (man Manager) addConfigs() {
 	man.addConfigBool("auth.require_http_message_signature", false,
 		"Require HTTP message signatures for fleetd requests (Premium feature)")
 	man.addConfigInt("auth.sso_rate_limit_per_minute", 0,
-		"Number of allowed requests per minute to the SSO callback endpoint (default uses the login rate limit value in a dedicated bucket)")
+		"Number of allowed requests per minute to the SSO callback and Fleet Desktop device SSO endpoints (each in its own bucket; defaults to the login rate limit value)")
 
 	// App
 	man.addConfigString("app.token_key", "CHANGEME",
@@ -1909,6 +1944,7 @@ func (man Manager) addConfigs() {
 	man.addConfigString("mdm.apple_bm_key", "", "Apple Business PEM-encoded private key path")
 	man.addConfigString("mdm.apple_bm_key_bytes", "", "Apple Business PEM-encoded private key bytes")
 	man.addConfigBool("mdm.apple_enable", false, "Enable MDM Apple functionality")
+	man.addConfigBool("mdm.apple_machineinfo_verify", true, "Verify the signature on Apple's x-apple-aspen-deviceinfo (MachineInfo) blob during enrollment")
 	man.addConfigInt("mdm.apple_scep_signer_validity_days", 365, "Days signed client certificates will be valid")
 	man.addConfigString("mdm.apple_vpp_app_metadata_api_bearer_token", "", "Apple Connect JWT, used for accessing VPP app metadata directly from Apple")
 	man.addConfigString("mdm.apple_scep_challenge", "", "SCEP static challenge for enrollment")
@@ -1963,6 +1999,18 @@ func (man Manager) addConfigs() {
 	// Conditional Access
 	man.addConfigString("conditional_access.cert_serial_format", "hex",
 		"Format for parsing certificate serial numbers from X-Client-Cert-Serial header: 'hex' (default, used by AWS ALB) or 'decimal' (used by Caddy)")
+
+	// WebSocket agent transport
+	man.addConfigBool("websocket.transport_enabled", false,
+		"Enable the agent WebSocket notification transport (experimental)")
+	man.addConfigDuration("websocket.ping_interval", 5*time.Minute,
+		"Interval between WebSocket keepalive pings sent to connected agents")
+	man.addConfigDuration("websocket.pong_timeout", 30*time.Second,
+		"Time to wait for a pong before considering an agent WebSocket connection dead")
+	man.addConfigDuration("websocket.check_interval", 30*time.Second,
+		"Interval of the per-instance job that notifies connected agents with due interval work")
+	man.addConfigInt("websocket.check_batch_size", 500,
+		"Number of connected agents checked per batch by the interval notification job")
 }
 
 func (man Manager) hideConfig(name string) {
@@ -2273,6 +2321,7 @@ func (man Manager) LoadConfig() FleetConfig {
 			AppleBMKey:                        man.getConfigString("mdm.apple_bm_key"),
 			AppleBMKeyBytes:                   man.getConfigString("mdm.apple_bm_key_bytes"),
 			AppleEnable:                       man.getConfigBool("mdm.apple_enable"),
+			AppleMachineInfoVerify:            man.getConfigBool("mdm.apple_machineinfo_verify"),
 			AppleSCEPSignerValidityDays:       man.getConfigInt("mdm.apple_scep_signer_validity_days"),
 			AppleConnectJWT:                   man.getConfigString("mdm.apple_vpp_app_metadata_api_bearer_token"),
 			AppleSCEPChallenge:                man.getConfigString("mdm.apple_scep_challenge"),
@@ -2313,6 +2362,13 @@ func (man Manager) LoadConfig() FleetConfig {
 		},
 		ConditionalAccess: ConditionalAccessConfig{
 			CertSerialFormat: man.getConfigString("conditional_access.cert_serial_format"),
+		},
+		WebSocket: WebSocketConfig{
+			TransportEnabled: man.getConfigBool("websocket.transport_enabled"),
+			PingInterval:     man.getConfigDuration("websocket.ping_interval"),
+			PongTimeout:      man.getConfigDuration("websocket.pong_timeout"),
+			CheckInterval:    man.getConfigDuration("websocket.check_interval"),
+			CheckBatchSize:   man.getConfigInt("websocket.check_batch_size"),
 		},
 	}
 
@@ -2772,6 +2828,13 @@ func TestConfig() FleetConfig {
 		},
 		MDM: MDMConfig{
 			AllowOrbitEndUserAuthBypass: true,
+		},
+		WebSocket: WebSocketConfig{
+			TransportEnabled: false,
+			PingInterval:     5 * time.Minute,
+			PongTimeout:      30 * time.Second,
+			CheckInterval:    30 * time.Second,
+			CheckBatchSize:   500,
 		},
 	}
 }

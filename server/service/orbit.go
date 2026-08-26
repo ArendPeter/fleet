@@ -686,6 +686,13 @@ func (svc *Service) GetOrbitConfig(ctx context.Context) (fleet.OrbitConfig, erro
 		notifs.PendingSoftwareInstallerIDs = pendingInstalls
 	}
 
+	// The WebSocket transport directive is server-config driven and applies to
+	// all hosts regardless of team.
+	var wsTransport *fleet.OrbitWebSocketTransportConfig
+	if svc.config.WebSocket.TransportEnabled {
+		wsTransport = &fleet.OrbitWebSocketTransportConfig{Enabled: true}
+	}
+
 	// team ID is not nil, get team specific flags and options
 	if host.TeamID != nil {
 		teamAgentOptions, err := svc.ds.TeamAgentOptions(ctx, *host.TeamID)
@@ -753,7 +760,7 @@ func (svc *Service) GetOrbitConfig(ctx context.Context) (fleet.OrbitConfig, erro
 			&notifs,
 			host,
 			appConfig,
-			mdmConfig.EnableDiskEncryption,
+			mdmConfig.DiskEncryptionConfig(),
 			isConnectedToFleetMDM,
 			mdmInfo,
 		)
@@ -781,13 +788,14 @@ func (svc *Service) GetOrbitConfig(ctx context.Context) (fleet.OrbitConfig, erro
 		}
 
 		return fleet.OrbitConfig{
-			ScriptExeTimeout: opts.ScriptExecutionTimeout,
-			Flags:            mergedFlags,
-			Extensions:       extensionsFiltered,
-			Notifications:    notifs,
-			NudgeConfig:      nudgeConfig,
-			UpdateChannels:   updateChannels,
-			DebugLogging:     debugLogging,
+			ScriptExeTimeout:   opts.ScriptExecutionTimeout,
+			Flags:              mergedFlags,
+			Extensions:         extensionsFiltered,
+			Notifications:      notifs,
+			NudgeConfig:        nudgeConfig,
+			UpdateChannels:     updateChannels,
+			DebugLogging:       debugLogging,
+			WebSocketTransport: wsTransport,
 		}, nil
 	}
 
@@ -834,7 +842,7 @@ func (svc *Service) GetOrbitConfig(ctx context.Context) (fleet.OrbitConfig, erro
 		&notifs,
 		host,
 		appConfig,
-		appConfig.MDM.EnableDiskEncryption.Value,
+		appConfig.MDM.DiskEncryptionConfig(),
 		isConnectedToFleetMDM,
 		mdmInfo,
 	)
@@ -862,13 +870,14 @@ func (svc *Service) GetOrbitConfig(ctx context.Context) (fleet.OrbitConfig, erro
 	}
 
 	return fleet.OrbitConfig{
-		ScriptExeTimeout: opts.ScriptExecutionTimeout,
-		Flags:            mergedFlags,
-		Extensions:       extensionsFiltered,
-		Notifications:    notifs,
-		NudgeConfig:      nudgeConfig,
-		UpdateChannels:   updateChannels,
-		DebugLogging:     debugLogging,
+		ScriptExeTimeout:   opts.ScriptExecutionTimeout,
+		Flags:              mergedFlags,
+		Extensions:         extensionsFiltered,
+		Notifications:      notifs,
+		NudgeConfig:        nudgeConfig,
+		UpdateChannels:     updateChannels,
+		DebugLogging:       debugLogging,
+		WebSocketTransport: wsTransport,
 	}, nil
 }
 
@@ -959,15 +968,25 @@ func (svc *Service) setDiskEncryptionNotifications(
 	notifs *fleet.OrbitConfigNotifications,
 	host *fleet.Host,
 	appConfig *fleet.AppConfig,
-	diskEncryptionConfigured bool,
+	diskEncryption fleet.DiskEncryptionConfig,
 	isConnectedToFleetMDM bool,
 	mdmInfo *fleet.HostMDM,
 ) error {
+	// each platform's notifications are gated on that platform's own settings;
+	// the FileVault/Escrow Buddy flow treats the macOS pair as one unit until
+	// the per-payload split ships
+	var platformConfigured bool
+	switch host.FleetPlatform() {
+	case "darwin":
+		platformConfigured = diskEncryption.MacOSEnabled || diskEncryption.MacOSEscrowEnabled
+	case "windows":
+		platformConfigured = diskEncryption.WindowsEnabled
+	}
 	anyMDMConfigured := appConfig.MDM.EnabledAndConfigured || appConfig.MDM.WindowsEnabledAndConfigured
 	if !anyMDMConfigured ||
 		!isConnectedToFleetMDM ||
 		!host.IsOsqueryEnrolled() ||
-		!diskEncryptionConfigured {
+		!platformConfigured {
 		return nil
 	}
 
